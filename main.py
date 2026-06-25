@@ -3,12 +3,13 @@ from tkinter import PhotoImage
 from pygame import mixer, event, USEREVENT
 import pygame
 from random import randint
+import time
 
 from threading import Thread
 import json
 import xdialog
 from googletrans import Translator, LANGUAGES
-import libretranslatepy
+import google.generativeai as genai
 import requests
 import os
 import platform
@@ -57,8 +58,7 @@ translated_lines_math = 0
 
 yandex_api = 'Enter'
 yandex_folder_api = 'Enter'
-libre_api = 'Enter'
-libre_url = 'Enter'
+gemini_api = 'Enter'
 
 def music_loop():
     if music_looped == True:
@@ -204,12 +204,15 @@ def update_progress():
         des.update_idletasks()
 
 def translate_process():
-    global total_lines, translated_lines, music_looped, yandex_api, yandex_folder_api, libre_api, libre_url
+    global total_lines, translated_lines, music_looped, yandex_api, yandex_folder_api, gemini_api
 
     source_lang = lang_frame_source_combo.get()
     target_lang = lang_frame_target_combo.get()
     source_path = source_file_frame_textbox.get()
     target_path = target_file_frame_textbox.get()
+
+    gemini_cache_keys = []
+    gemini_cache_values = []
 
     if translator_api.get() == 1:
         inputer_api = CTkInputDialog(text="Yandex Translate API", title="Deltarune Translator")
@@ -217,11 +220,9 @@ def translate_process():
         folder_id_api = CTkInputDialog(text="Yandex Translate Folder ID", title="Deltarune Translator")
         yandex_folder_api = folder_id_api.get_input()
     elif translator_api.get() == 2:
-        inputer_api = CTkInputDialog(text="LibreTranslate instances URL", title="Deltarune Translator")
-        libre_url = inputer_api.get_input()
-        api_inputer = CTkInputDialog(text="LibreTranslate API", title="Deltarune Translator")
-        libre_api = api_inputer.get_input()
-        libretrans = libretranslatepy.LibreTranslateAPI(libre_url, libre_api)
+        inputer_api = CTkInputDialog(text="Gemini API Key\n(get free at aistudio.google.com)", title="Deltarune Translator")
+        gemini_api = inputer_api.get_input()
+        genai.configure(api_key=gemini_api)
 
     try:
         progress_text.configure(text='Checking lines from source file')
@@ -282,18 +283,91 @@ def translate_process():
                         log_textbox.insert("0.0", f"Error translating {key}: {str(e)}\n")
                         translated_lines += 1
                 elif translator_api.get() == 2:
-                    try:
-                        translated = libretrans.translate(value, source_lang, target_lang)
+                    gemini_cache_keys.append(key)
+                    gemini_cache_values.append(value)
+                    
+                    log_textbox.insert("0.0", f"[В очереди] {value}\n")
 
-                        data[key] = translated
 
-                        translated_lines += 1
+                    if gemini_model_var.get() == 0:
+                        if len(gemini_cache_values) >= 40 or (translated_lines + len(gemini_cache_values) >= total_lines):
+                            try:
+                                gemini_model = genai.GenerativeModel('gemini-3.1-flash-lite')
+                                
+                                prompt = (
+                                    f"Translate the following list of game texts from Deltarune from {source_lang} to {target_lang}.\n"
+                                    "Keep all control codes completely unchanged (\\E0, \\M0, ^1, ^6, /%, %%, & etc.).\n"
+                                    "Character names: クリス=Крис, スージー=Сьюзи, ラルセイ=Ральсей, ノエル=Ноэль.\n"
+                                    "Return ONLY a valid JSON array of strings containing the translations, in the exact same order. "
+                                    "Do not include Markdown block formatting (no ```json). Just the clean JSON array.\n\n"
+                                    f"{json.dumps(gemini_cache_values, ensure_ascii=False)}"
+                                )
+                                
+                                response = gemini_model.generate_content(prompt)
+                                response_text = response.text.strip()
+                                
+                                if response_text.startswith("```"):
+                                    response_text = response_text.strip("`").strip("json").strip()
+                                    
+                                translated_array = json.loads(response_text)
+                                
+                                for b_key, orig_val, trans_val in zip(gemini_cache_keys, gemini_cache_values, translated_array):
+                                    data[b_key] = trans_val
+                                    translated_lines += 1
+                                    log_textbox.insert("0.0", f"[Успех] {orig_val} > {trans_val}\n")
 
-                        log_textbox.insert("0.0", f"{value} > {translated}\n")
-                    except Exception as e:
-                        error_sfx.play()
-                        log_textbox.insert("0.0", f"Error translating {key}: {str(e)}\n")
-                        translated_lines += 1
+                                gemini_cache_keys = []
+                                gemini_cache_values = []
+
+                                if gemini_model_var.get() == 0:
+                                    time.sleep(3.1)
+                            except Exception as e:
+                                error_sfx.play()
+                                log_textbox.insert("0.0", f"Ошибка пакета Gemini: {str(e)}\nРазбиваем пакет на оригиналы...\n")
+                                for b_key in gemini_cache_keys:
+                                    translated_lines += 1
+                                gemini_cache_keys = []
+                                gemini_cache_values = []
+                                time.sleep(2.0)
+                    else:
+                        if len(gemini_cache_values) >= 500 or (translated_lines + len(gemini_cache_values) >= total_lines):
+                            try:
+                                gemini_model = genai.GenerativeModel('gemini-3.5-flash')
+                                
+                                prompt = (
+                                    f"Translate the following list of game texts from Deltarune from {source_lang} to {target_lang}.\n"
+                                    "Keep all control codes completely unchanged (\\E0, \\M0, ^1, ^6, /%, %%, & etc.).\n"
+                                    "Character names: クリス=Крис, スージー=Сьюзи, ラルセイ=Ральсей, ノエル=Ноэль.\n"
+                                    "Return ONLY a valid JSON array of strings containing the translations, in the exact same order. "
+                                    "Do not include Markdown block formatting (no ```json). Just the clean JSON array.\n\n"
+                                    f"{json.dumps(gemini_cache_values, ensure_ascii=False)}"
+                                )
+                                
+                                response = gemini_model.generate_content(prompt)
+                                response_text = response.text.strip()
+                                
+                                if response_text.startswith("```"):
+                                    response_text = response_text.strip("`").strip("json").strip()
+                                    
+                                translated_array = json.loads(response_text)
+                                
+                                for b_key, orig_val, trans_val in zip(gemini_cache_keys, gemini_cache_values, translated_array):
+                                    data[b_key] = trans_val
+                                    translated_lines += 1
+                                    log_textbox.insert("0.0", f"[Успех] {orig_val} > {trans_val}\n")
+
+                                gemini_cache_keys = []
+                                gemini_cache_values = []
+
+                                time.sleep(5.1)
+                            except Exception as e:
+                                error_sfx.play()
+                                log_textbox.insert("0.0", f"Ошибка пакета Gemini: {str(e)}\nРазбиваем пакет на оригиналы...\n")
+                                for b_key in gemini_cache_keys:
+                                    translated_lines += 1
+                                gemini_cache_keys = []
+                                gemini_cache_values = []
+                                time.sleep(2.0)
                 update_progress()
                 des.update()
 
@@ -316,6 +390,8 @@ def translate_process():
         tarnslator_frame_radio_google.configure(state='normal')
         tarnslator_frame_radio_yandex.configure(state='normal')
         tarnslator_frame_radio_libre.configure(state='normal')
+        gemini_model_radio_fast.configure(state='normal')
+        gemini_model_radio_accurate.configure(state='normal')
         des.update()
         des.after(1000)
         music_looped = True
@@ -335,6 +411,8 @@ def translate_process():
         tarnslator_frame_radio_google.configure(state='normal')
         tarnslator_frame_radio_yandex.configure(state='normal')
         tarnslator_frame_radio_libre.configure(state='normal')
+        gemini_model_radio_fast.configure(state='normal')
+        gemini_model_radio_accurate.configure(state='normal')
         des.update()
         des.after(1000)
         music_looped = True
@@ -360,6 +438,8 @@ def start_translate():
         tarnslator_frame_radio_google.configure(state='disabled')
         tarnslator_frame_radio_yandex.configure(state='disabled')
         tarnslator_frame_radio_libre.configure(state='disabled')
+        gemini_model_radio_fast.configure(state='disabled')
+        gemini_model_radio_accurate.configure(state='disabled')
 
         Thread(target=translate_process).start()
 
@@ -401,7 +481,7 @@ lang_frame_target_combo.place(x=135,y=66)
 lang_frame.place(x=20, y=175)
 
 
-tarnslator_frame = CTkFrame(main_frame, width=350, height=100, bg_color='#2e2e2e', fg_color="#2e2e2e")
+tarnslator_frame = CTkFrame(main_frame, width=350, height=140, bg_color='#2e2e2e', fg_color="#2e2e2e")
 translator_api = IntVar(tarnslator_frame, value=0)
 
 tarnslator_frame_header = CTkLabel(tarnslator_frame, text='Translate API', text_color='white', font=('Arial', 15))
@@ -413,20 +493,28 @@ tarnslator_frame_radio_google.place(x=15, y=50)
 tarnslator_frame_radio_yandex = CTkRadioButton(tarnslator_frame, text='Yandex', text_color='white', font=('Arial', 20), fg_color='white', value=1, variable=translator_api, hover_color='grey')
 tarnslator_frame_radio_yandex.place(x=125, y=50)
 
-tarnslator_frame_radio_libre = CTkRadioButton(tarnslator_frame, text='Libre', text_color='white', font=('Arial', 20), fg_color='white', value=2, variable=translator_api, hover_color='grey')
+tarnslator_frame_radio_libre = CTkRadioButton(tarnslator_frame, text='Gemini', text_color='white', font=('Arial', 20), fg_color='white', value=2, variable=translator_api, hover_color='grey')
 tarnslator_frame_radio_libre.place(x=240, y=50)
+
+gemini_model_var = IntVar(tarnslator_frame, value=0)
+gemini_model_label = CTkLabel(tarnslator_frame, text='Gemini mode:', text_color='grey', font=('Arial', 13))
+gemini_model_label.place(x=15, y=95)
+gemini_model_radio_fast = CTkRadioButton(tarnslator_frame, text='Fast', text_color='white', font=('Arial', 15), fg_color='white', value=0, variable=gemini_model_var, hover_color='grey')
+gemini_model_radio_fast.place(x=130, y=95)
+gemini_model_radio_accurate = CTkRadioButton(tarnslator_frame, text='Accurate', text_color='white', font=('Arial', 15), fg_color='white', value=1, variable=gemini_model_var, hover_color='grey')
+gemini_model_radio_accurate.place(x=210, y=95)
 tarnslator_frame.place(x=390, y=175)
 
 
 progress_header = CTkLabel(main_frame, text='Translate Progress:', text_color='white', font=('Arial', 15))
 progress_header.place(x=20,y=300)
 progress_text = CTkLabel(main_frame, text='Ready', text_color='white', font=('Arial', 15))
-progress_text.place(x=335,y=300)
+progress_text.place(x=230,y=300)
 progress_var = IntVar(main_frame, value=0)
 progress_progressbar = CTkProgressBar(main_frame, progress_color='white', fg_color='#2e2e2e', variable=progress_var, width=600, height=10)
 progress_progressbar.place(x=20, y=330)
 start_translate_button = CTkButton(main_frame, text='Translate!', height=30, width=100, text_color='white', bg_color='#2e2e2e', fg_color='#2e2e2e', hover_color='grey', font=('Arial', 15), command=start_translate)
-start_translate_button.place(x=630, y=310)
+start_translate_button.place(x=630, y=327)
 
 #Логи
 log_frame = CTkFrame(des, width=760, height=400, fg_color="#3A3838",bg_color="#353535")
