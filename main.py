@@ -11,7 +11,7 @@ import xdialog
 from googletrans import Translator, LANGUAGES
 import google.generativeai as genai
 import requests
-import os
+import os, re
 import platform
 
 pygame.init()
@@ -182,14 +182,64 @@ def change_target_lang():
     target_file_frame_textbox.delete(0, 'end')
     target_file_frame_textbox.insert('end', set_lang)
 
-def should_translate(key, value):
+def detect_lang_simple(text):
+    """
+    Быстрое определение языка строки без внешних библиотек.
+    Смотрит на Unicode-блоки символов в тексте.
+    """
+    # Убираем управляющие коды и знаки препинания — смотрим только на буквы
+    clean = re.sub(r'\\[A-Za-z0-9]+|\^[0-9]+|[/\\%&^0-9\s\W]', '', text)
+    if not clean:
+        return None
+
+    counts = {
+        'ja': len(re.findall(r'[\u3040-\u309F\u30A0-\u30FF]', clean)),
+        'ru': len(re.findall(r'[\u0400-\u04FF]', clean)),
+        'ko': len(re.findall(r'[\uAC00-\uD7AF\u1100-\u11FF]', clean)),
+        'ar': len(re.findall(r'[\u0600-\u06FF]', clean)),
+        'zh': len(re.findall(r'[\u4E00-\u9FFF]', clean)),
+        'el': len(re.findall(r'[\u0370-\u03FF]', clean)),
+        'he': len(re.findall(r'[\u0590-\u05FF]', clean)),
+        'th': len(re.findall(r'[\u0E00-\u0E7F]', clean)),
+        'latin': len(re.findall(r'[A-Za-z\u00C0-\u024F]', clean)),
+    }
+
+    dominant = max(counts, key=counts.get)
+    if counts[dominant] == 0:
+        return None
+    return dominant
+
+# Таблица: код языка из googletrans -> что вернёт detect_lang_simple
+LANG_TO_SCRIPT = {
+    'ja': 'ja', 'zh-cn': 'zh', 'zh-tw': 'zh', 'ko': 'ko',
+    'ru': 'ru', 'uk': 'ru', 'bg': 'ru',
+    'ar': 'ar', 'he': 'he', 'el': 'el', 'th': 'th',
+    # Все латинские языки (en, de, fr, es, it, pl, pt, nl, sv...):
+    # отсутствие в таблице -> 'latin'
+}
+
+def should_translate(key, value, source_lang=None):
     if key == "date":
         return False
     if not isinstance(value, str):
         return False
     if not value.strip():
         return False
-    return True
+
+    if source_lang is None:
+        return True
+
+    detected = detect_lang_simple(value)
+    if detected is None:
+        # Строка состоит только из кодов/цифр/пунктуации — пропускаем
+        return False
+
+    expected_script = LANG_TO_SCRIPT.get(source_lang, 'latin')
+    if expected_script == 'latin':
+        # Если исходный язык латинский — переводим только латинские строки
+        return detected == 'latin'
+    else:
+        return detected == expected_script
 
 def update_progress():
     global translated_lines_math
@@ -202,6 +252,88 @@ def update_progress():
             text=f"{translated_lines}/{total_lines}"
         )
         des.update_idletasks()
+
+def extract_codes(text):
+    """Извлекает все управляющие коды из строки."""
+    return re.findall(r'\\[A-Za-z0-9]+|\^[0-9]+|/+%*|%%|&|\u3000|\\n', str(text))
+ 
+def extract_critical_codes(text):
+    """Извлекает только критичные коды, удаление которых ломает игру."""
+    return re.findall(r'%%|&', str(text))
+
+def restore_codes(original, translated):
+    # Строгая проверка только критичных кодов (%% и &).
+    # Остальные коды (^6, \M0 и т.д.) Gemini обычно сохраняет правильно,
+    # поэтому требовать их точного совпадения слишком жёстко — это
+    # была основная причина, по которой строки оставались японскими.
+    orig_critical = extract_critical_codes(original)
+    trans_critical = extract_critical_codes(translated)
+    if orig_critical != trans_critical:
+        return None
+    return translated
+
+
+def reassemble_text(original_structure, translated_texts_list):
+    """
+    Берет оригинальную структуру кодов и поочередно подставляет 
+    переведенные куски текста вместо оригинальных.
+    """
+    result = ""
+    text_idx = 0
+    for item in original_structure:
+        if item['type'] == 'code':
+            result += item['val']
+        else:
+            if text_idx < len(translated_texts_list):
+                result += translated_texts_list[text_idx]
+                text_idx += 1
+            else:
+                result += item['val'] # Фолбэк на оригинал, если ИИ пропустил кусок
+    return result
+
+def safe_json_loads(text):
+    """
+    Парсит JSON из ответа Gemini, обрабатывая невалидные escape-последовательности.
+    Gemini иногда возвращает \\M1, \\E0 и т.д. без двойного слеша,
+    что является невалидным JSON. Эта функция исправляет это перед парсингом.
+    """
+    text = text.strip()
+    # Убираем markdown-обёртку если есть
+    if text.startswith("```"):
+        text = re.sub(r'^```[a-z]*\n?', '', text)
+        text = re.sub(r'\n?```$', '', text)
+        text = text.strip()
+
+    # Находим содержимое каждой JSON-строки и чиним невалидные backslash-escapes.
+    # Валидные JSON escapes: \\ \" \/ \b \f \n \r \t \uXXXX — всё остальное экранируем.
+    def fix_escapes(m):
+        s = m.group(0)
+        result = []
+        i = 0
+        while i < len(s):
+            if s[i] == '\\' and i + 1 < len(s):
+                nxt = s[i + 1]
+                if nxt in '\\"' or nxt in '/bfnrtu':
+                    result.append('\\')
+                    result.append(nxt)
+                    i += 2
+                else:
+                    result.append('\\\\')  # экранируем одиночный слеш
+                    i += 1
+            else:
+                result.append(s[i])
+                i += 1
+        return ''.join(result)
+
+    fixed = re.sub(r'(?<=": ")(?:[^\\"]|\\.)*(?=")', fix_escapes, text)
+    result = json.loads(fixed)
+    # Gemini иногда пишет буквально "\\u3000" как текст вместо реального символа.
+    # Исправляем это после парсинга.
+    if isinstance(result, dict):
+        for k, v in result.items():
+            if isinstance(v, str) and '\\u3000' in v:
+                result[k] = v.replace('\\u3000', '\u3000')
+    return result
 
 def translate_process():
     global total_lines, translated_lines, music_looped, yandex_api, yandex_folder_api, gemini_api
@@ -233,7 +365,7 @@ def translate_process():
         translated_lines = 0
 
         for key, value in data.items():
-            if should_translate(key, value):
+            if should_translate(key, value, source_lang):
                 total_lines += 1
 
         log_textbox.insert("0.0", f"Found {total_lines} lines to translate\n")
@@ -241,7 +373,7 @@ def translate_process():
         des.update()
 
         for key, value in data.items():
-            if should_translate(key, value):
+            if should_translate(key, value, source_lang):
                 if translator_api.get() == 0:
                     try:
                         translated = translator.translate(
@@ -290,31 +422,65 @@ def translate_process():
 
 
                     if gemini_model_var.get() == 0:
-                        if len(gemini_cache_values) >= 40 or (translated_lines + len(gemini_cache_values) >= total_lines):
+                        if len(gemini_cache_values) >= 100 or (translated_lines + len(gemini_cache_values) >= total_lines):
                             try:
                                 gemini_model = genai.GenerativeModel('gemini-3.1-flash-lite')
                                 
+                                # Подготавливаем структуры и чистый текст для отправки
+                                batch_structures = []
+                                texts_to_translate = []
+                                
+                                # Формируем словарь для отправки, чтобы ИИ видел контекст строк
+                                payload = {f"str_{i}": val for i, val in enumerate(gemini_cache_values)}
+                                
                                 prompt = (
-                                    f"Translate the following list of game texts from Deltarune from {source_lang} to {target_lang}.\n"
-                                    "Keep all control codes completely unchanged (\\E0, \\M0, ^1, ^6, /%, %%, & etc.).\n"
-                                    "Character names: クリス=Крис, スージー=Сьюзи, ラルセイ=Ральсей, ノエル=Ноэль.\n"
-                                    "Return ONLY a valid JSON array of strings containing the translations, in the exact same order. "
-                                    "Do not include Markdown block formatting (no ```json). Just the clean JSON array.\n\n"
-                                    f"{json.dumps(gemini_cache_values, ensure_ascii=False)}"
+                                    f"You are a professional game translator specializing in Deltarune localization from {source_lang} to {target_lang}.\n"
+                                    "CRITICAL RULES:\n"
+                                    "- NEVER remove, alter, translate, or reorder ANY control codes. These include but are not limited to:\n"
+                                    "  \\E0, \\E1, \\M0, \\M1, \\M2, ^0, ^1, ^2, ^3, ^4, ^5, ^6, ^7, ^8, ^9, /%, %%, %, &, /, \\n, \\t, and any other non-alphabetic sequences.\n"
+                                    "- Control codes MUST retain their exact position relative to the surrounding text.\n"
+                                    "- If a control code is at the start/end of a string, it MUST remain at the start/end in the translation.\n"
+                                    "- If a control code is between words, it MUST stay between the translated words in the same order.\n\n"
+                                    "TRANSLATION GUIDELINES:\n"
+                                    "- Translate ONLY the human-readable text. Leave ALL codes untouched.\n"
+                                    "- Preserve punctuation (？ → ?), spacing, and line breaks relative to the codes.\n"
+                                    "- Character names MUST be translated as follows: \n"
+                                    "  クリス=Крис, スージー=Сьюзи, ラルセイ=Ральсей, ノエル=Ноэль, ルルー=Рулу, ジャルグ=Джалг, ベリル=Берилл.\n"
+                                    "- Maintain the original tone: casual, emotional, or formal, depending on the context.\n\n"
+                                    "EXAMPLES:\n"
+                                    'Original: "聞コエマスカ^6？\\M1 ^6 %"\n'
+                                    'Correct: "Ты меня слышишь?^6?\\M1 ^6 %"\n'
+                                    'Incorrect: "Ты меня слышишь? ^6? \\M1 ^6 %" (extra spaces) or "Ты меня слышишь?^6?\\M1 %" (missing code).\n\n'
+                                    'Original: "^6 \\M0ワレワレハ^6& 接続サレテ& イマスカ^6？\\M1 ^6 ^6 %%"\n'
+                                    'Correct: "^6 \\M0Мы^6& соединены?& Или нет?^6?\\M1 ^6 ^6 %%"\n'
+                                    'Incorrect: "^6 \\M0 Мы ^6 & соединены & или нет? ^6? \\M1 ^6 ^6 %%" (spaces around codes).\n\n'
+                                    "OUTPUT FORMAT:\n"
+                                    "- Return ONLY a valid JSON object with the SAME keys as the input.\n"
+                                    "- Do NOT add comments, explanations, or markdown formatting (e.g., no ```json).\n"
+                                    "- Ensure the output is parseable as JSON. Escape special characters if necessary.\n\n"
+                                    f"DATA TO TRANSLATE:\n{json.dumps(payload, ensure_ascii=False)}"
                                 )
                                 
                                 response = gemini_model.generate_content(prompt)
                                 response_text = response.text.strip()
                                 
-                                if response_text.startswith("```"):
-                                    response_text = response_text.strip("`").strip("json").strip()
-                                    
-                                translated_array = json.loads(response_text)
+                                translated_obj = safe_json_loads(response_text)
                                 
-                                for b_key, orig_val, trans_val in zip(gemini_cache_keys, gemini_cache_values, translated_array):
-                                    data[b_key] = trans_val
+                                # Раскладываем перевод обратно в базу данных игры
+                                for i, (b_key, orig_val) in enumerate(zip(gemini_cache_keys, gemini_cache_values)):
+                                    key_id = f"str_{i}"
+                                    trans_val = translated_obj.get(key_id, orig_val)
+                                    
+                                    # Финальная питоновская проверка на то, что ИИ не удалил важные коды (%% или &)
+                                    fixed = restore_codes(orig_val, trans_val)
+                                    if fixed is None:
+                                        data[b_key] = orig_val
+                                        log_textbox.insert("0.0", f"[!] Коды не совпали, оставлен оригинал: {orig_val}\n")
+                                    else:
+                                        data[b_key] = fixed
+                                        log_textbox.insert("0.0", f"[Успех] {orig_val} -> {fixed}\n")
+                                        
                                     translated_lines += 1
-                                    log_textbox.insert("0.0", f"[Успех] {orig_val} > {trans_val}\n")
 
                                 gemini_cache_keys = []
                                 gemini_cache_values = []
@@ -323,38 +489,69 @@ def translate_process():
                                     time.sleep(3.1)
                             except Exception as e:
                                 error_sfx.play()
-                                log_textbox.insert("0.0", f"Ошибка пакета Gemini: {str(e)}\nРазбиваем пакет на оригиналы...\n")
-                                for b_key in gemini_cache_keys:
+                                log_textbox.insert("0.0", f"Ошибка пакета Gemini: {str(e)}\nСкидываем пакет в оригиналы...\n")
+                                for b_key, orig_val in zip(gemini_cache_keys, gemini_cache_values):
+                                    data[b_key] = orig_val
                                     translated_lines += 1
                                 gemini_cache_keys = []
                                 gemini_cache_values = []
                                 time.sleep(2.0)
                     else:
-                        if len(gemini_cache_values) >= 500 or (translated_lines + len(gemini_cache_values) >= total_lines):
+                        if len(gemini_cache_values) >= 600 or (translated_lines + len(gemini_cache_values) >= total_lines):
                             try:
                                 gemini_model = genai.GenerativeModel('gemini-3.5-flash')
                                 
+                                # Формируем словарь для отправки, чтобы ИИ видел контекст строк
+                                payload = {f"str_{i}": val for i, val in enumerate(gemini_cache_values)}
+                                
                                 prompt = (
-                                    f"Translate the following list of game texts from Deltarune from {source_lang} to {target_lang}.\n"
-                                    "Keep all control codes completely unchanged (\\E0, \\M0, ^1, ^6, /%, %%, & etc.).\n"
-                                    "Character names: クリス=Крис, スージー=Сьюзи, ラルセイ=Ральсей, ノエル=Ноэль.\n"
-                                    "Return ONLY a valid JSON array of strings containing the translations, in the exact same order. "
-                                    "Do not include Markdown block formatting (no ```json). Just the clean JSON array.\n\n"
-                                    f"{json.dumps(gemini_cache_values, ensure_ascii=False)}"
+                                    f"You are a professional game translator specializing in Deltarune localization from {source_lang} to {target_lang}.\n"
+                                    "CRITICAL RULES:\n"
+                                    "- NEVER remove, alter, translate, or reorder ANY control codes. These include but are not limited to:\n"
+                                    "  \\E0, \\E1, \\M0, \\M1, \\M2, ^0, ^1, ^2, ^3, ^4, ^5, ^6, ^7, ^8, ^9, /%, %%, %, &, /, \\n, \\t, and any other non-alphabetic sequences.\n"
+                                    "- Control codes MUST retain their exact position relative to the surrounding text.\n"
+                                    "- If a control code is at the start/end of a string, it MUST remain at the start/end in the translation.\n"
+                                    "- If a control code is between words, it MUST stay between the translated words in the same order.\n\n"
+                                    "TRANSLATION GUIDELINES:\n"
+                                    "- Translate ONLY the human-readable text. Leave ALL codes untouched.\n"
+                                    "- Preserve punctuation (？ → ?), spacing, and line breaks relative to the codes.\n"
+                                    "- Character names MUST be translated as follows: \n"
+                                    "  クリス=Крис, スージー=Сьюзи, ラルセイ=Ральсей, ノエル=Ноэль, ルルー=Рулу, ジャルグ=Джалг, ベリル=Берилл.\n"
+                                    "- Maintain the original tone: casual, emotional, or formal, depending on the context.\n\n"
+                                    "EXAMPLES:\n"
+                                    'Original: "聞コエマスカ^6？\\M1 ^6 %"\n'
+                                    'Correct: "Ты меня слышишь?^6?\\M1 ^6 %"\n'
+                                    'Incorrect: "Ты меня слышишь? ^6? \\M1 ^6 %" (extra spaces) or "Ты меня слышишь?^6?\\M1 %" (missing code).\n\n'
+                                    'Original: "^6 \\M0ワレワレハ^6& 接続サレテ& イマスカ^6？\\M1 ^6 ^6 %%"\n'
+                                    'Correct: "^6 \\M0Мы^6& соединены?& Или нет?^6?\\M1 ^6 ^6 %%"\n'
+                                    'Incorrect: "^6 \\M0 Мы ^6 & соединены & или нет? ^6? \\M1 ^6 ^6 %%" (spaces around codes).\n\n'
+                                    "OUTPUT FORMAT:\n"
+                                    "- Return ONLY a valid JSON object with the SAME keys as the input.\n"
+                                    "- Do NOT add comments, explanations, or markdown formatting (e.g., no ```json).\n"
+                                    "- Ensure the output is parseable as JSON. Escape special characters if necessary.\n\n"
+                                    f"DATA TO TRANSLATE:\n{json.dumps(payload, ensure_ascii=False)}"
                                 )
                                 
                                 response = gemini_model.generate_content(prompt)
                                 response_text = response.text.strip()
                                 
-                                if response_text.startswith("```"):
-                                    response_text = response_text.strip("`").strip("json").strip()
-                                    
-                                translated_array = json.loads(response_text)
+                                translated_obj = safe_json_loads(response_text)
                                 
-                                for b_key, orig_val, trans_val in zip(gemini_cache_keys, gemini_cache_values, translated_array):
-                                    data[b_key] = trans_val
+                                # Раскладываем перевод обратно в базу данных игры
+                                for i, (b_key, orig_val) in enumerate(zip(gemini_cache_keys, gemini_cache_values)):
+                                    key_id = f"str_{i}"
+                                    trans_val = translated_obj.get(key_id, orig_val)
+                                    
+                                    # Финальная питоновская проверка на то, что ИИ не удалил важные коды (%% или &)
+                                    fixed = restore_codes(orig_val, trans_val)
+                                    if fixed is None:
+                                        data[b_key] = orig_val
+                                        log_textbox.insert("0.0", f"[!] Коды не совпали, оставлен оригинал: {orig_val}\n")
+                                    else:
+                                        data[b_key] = fixed
+                                        log_textbox.insert("0.0", f"[Успех] {orig_val} -> {fixed}\n")
+                                        
                                     translated_lines += 1
-                                    log_textbox.insert("0.0", f"[Успех] {orig_val} > {trans_val}\n")
 
                                 gemini_cache_keys = []
                                 gemini_cache_values = []
@@ -362,8 +559,9 @@ def translate_process():
                                 time.sleep(5.1)
                             except Exception as e:
                                 error_sfx.play()
-                                log_textbox.insert("0.0", f"Ошибка пакета Gemini: {str(e)}\nРазбиваем пакет на оригиналы...\n")
-                                for b_key in gemini_cache_keys:
+                                log_textbox.insert("0.0", f"Ошибка пакета Gemini: {str(e)}\nСкидываем пакет в оригиналы...\n")
+                                for b_key, orig_val in zip(gemini_cache_keys, gemini_cache_values):
+                                    data[b_key] = orig_val
                                     translated_lines += 1
                                 gemini_cache_keys = []
                                 gemini_cache_values = []
@@ -417,6 +615,358 @@ def translate_process():
         des.after(1000)
         music_looped = True
         music_loop()
+
+MAX_LINE_LEN = 20  # максимум символов на строку в Deltarune
+
+PUNCT_START = set('.,!?…»)』】〕\'"')
+
+def fix_hanging_punct(lines):
+    """Присоединяет висячую пунктуацию в начале строки к предыдущей."""
+    result = []
+    for line in lines:
+        stripped = line.lstrip('\u3000 ')
+        if result and stripped and stripped[0] in PUNCT_START:
+            result[-1] = result[-1].rstrip() + stripped[0]
+            rest = stripped[1:]
+            if rest.strip():
+                result.append('\u3000 ' + rest.lstrip())
+        else:
+            result.append(line)
+    return result
+
+
+def reflow_value(value):
+    """
+    Перераспределяет переносы строк (\\n) в одной игровой строке так,
+    чтобы видимый текст между кодами не превышал MAX_LINE_LEN символов.
+    Управляющие коды (\\E0, ^1, &, %% и т.д.) не считаются в длину.
+    """
+    # Паттерн для управляющих кодов — они невидимы на экране
+    code_pattern = re.compile(r'\\[A-Za-z0-9]+|\^[0-9]+|%%|/+%*|&|\u3000|~[0-9]|＊|\*|<!--.*?-->|#')
+
+    def visible_len(s):
+        return len(code_pattern.sub('', s))
+
+    # Разбиваем по \n — каждый кусок это отдельная строка на экране
+    segments = value.split('\n')
+    result_segments = []
+
+    for seg in segments:
+        # Если уже влезает — не трогаем
+        if visible_len(seg) <= MAX_LINE_LEN:
+            result_segments.append(seg)
+            continue
+
+        # Разбиваем сегмент на токены: код или слово
+        tokens = []
+        last = 0
+        for m in code_pattern.finditer(seg):
+            if m.start() > last:
+                # Текст между кодами — разбиваем по пробелам
+                for word in seg[last:m.start()].split(' '):
+                    if word:
+                        tokens.append(('word', word))
+                    tokens.append(('word', ' '))
+                if tokens and tokens[-1] == ('word', ' '):
+                    tokens.pop()
+            tokens.append(('code', m.group(0)))
+            last = m.end()
+        if last < len(seg):
+            for word in seg[last:].split(' '):
+                if word:
+                    tokens.append(('word', word))
+                tokens.append(('word', ' '))
+            if tokens and tokens[-1] == ('word', ' '):
+                tokens.pop()
+
+        # Собираем строки по MAX_LINE_LEN
+        lines = []
+        current = ''
+        current_len = 0
+
+        for ttype, tval in tokens:
+            if ttype == 'code':
+                current += tval
+            else:
+                word_len = len(tval)
+                if current_len + word_len > MAX_LINE_LEN and current_len > 0:
+                    lines.append(current.rstrip())
+                    current = tval.lstrip()
+                    current_len = len(current)
+                else:
+                    current += tval
+                    current_len += word_len
+
+        if current.strip():
+            lines.append(current.rstrip())
+
+        lines = fix_hanging_punct(lines)
+        result_segments.append('\n　 '.join(lines))
+
+    return '\n'.join(result_segments)
+
+
+def reflow_value_by_segments(value, orig_value):
+    """Делит перевод на столько же сегментов что в оригинале."""
+    code_pattern = re.compile(r'\\[A-Za-z0-9]+|\^[0-9]+|%%|/+%*|&|\u3000|~[0-9]|＊|\*|<!--.*?-->|#')
+    orig_segments = orig_value.split('\n')
+    n = len(orig_segments)
+    if n <= 1:
+        return value
+    flat = value.replace('\n', ' ').replace('\u3000', ' ')
+    flat = re.sub(r' +', ' ', flat).strip()
+    all_words = [w for p in code_pattern.split(flat) for w in p.split(' ') if w]
+    total_words = len(all_words)
+    if total_words == 0:
+        return value
+    words_per_seg = max(1, round(total_words / n))
+    tokens = []
+    pos = 0
+    for m in code_pattern.finditer(flat):
+        if m.start() > pos:
+            tokens.append(('text', flat[pos:m.start()]))
+        tokens.append(('code', m.group(0)))
+        pos = m.end()
+    if pos < len(flat):
+        tokens.append(('text', flat[pos:]))
+    segments = []
+    current = ''
+    word_count = 0
+    seg_idx = 0
+    for ttype, tval in tokens:
+        if ttype == 'code':
+            current += tval
+        else:
+            for word in tval.split(' '):
+                if not word:
+                    if current:
+                        current += ' '
+                    continue
+                if current and not current.endswith(' '):
+                    current += ' '
+                current += word
+                word_count += 1
+                if word_count >= words_per_seg and seg_idx < n - 1:
+                    segments.append(current.strip())
+                    current = ''
+                    word_count = 0
+                    seg_idx += 1
+    if current.strip():
+        segments.append(current.strip())
+    if not segments:
+        return value
+    segments = fix_hanging_punct(segments)
+    result = segments[0]
+    for s in segments[1:]:
+        result += '\n\u3000 ' + s
+    return result
+
+
+def reflow_process():
+    target_path = target_file_frame_textbox.get()
+    if not target_path:
+        progress_text.configure(text='Укажи Target file!')
+        des.update()
+        return
+    try:
+        progress_text.configure(text='Выравниваю...')
+        des.update()
+        with open(target_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        source_path = source_file_frame_textbox.get()
+        source_data = {}
+        if source_path:
+            try:
+                with open(source_path, 'r', encoding='utf-8') as f:
+                    source_data = json.load(f)
+            except Exception:
+                pass
+
+        changed = 0
+        for key, value in data.items():
+            if key == 'date' or not isinstance(value, str) or not value.strip():
+                continue
+            if '\\u3000' in value:
+                value = value.replace('\\u3000', '\u3000')
+                data[key] = value
+                changed += 1
+            if '\\n' in value:
+                value = value.replace('\\n', '\n')
+                data[key] = value
+                changed += 1
+            while '\n\n' in value:
+                value = value.replace('\n\n', '\n')
+                data[key] = value
+                changed += 1
+            if '＊' not in value:
+                continue
+            orig_value = source_data.get(key, '')
+            if orig_value and '\n' in orig_value:
+                new_val = reflow_value_by_segments(value, orig_value)
+            else:
+                new_val = reflow_value(value)
+            if new_val != value:
+                data[key] = new_val
+                changed += 1
+
+        dir_name, file_name = os.path.split(target_path)
+        base, ext = os.path.splitext(file_name)
+        output_path = os.path.join(dir_name, f"{base}_reflowed{ext}")
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+
+        done_sfx.play()
+        progress_text.configure(text=f'Готово! Исправлено строк: {changed}')
+        log_textbox.insert('0.0', f'[Выравнивание] Сохранено в: {output_path}\nИсправлено строк: {changed}\n')
+        des.update()
+    except Exception as e:
+        error_sfx.play()
+        progress_text.configure(text=f'Ошибка: {str(e)}')
+        des.update()
+    finally:
+        reflow_button.configure(state='normal')
+        start_translate_button.configure(state='normal')
+
+
+def extract_dialog_codes(text):
+    """Коды завершения диалога/страницы: %%, /%, %, /"""
+    # Порядок важен: сначала длинные паттерны
+    return re.findall(r'%%|/%|(?<![/%])%|(?<![%\\/])/$', str(text))
+
+def fix_dialog_codes(original, translated):
+    """
+    Берёт коды завершения из оригинала и вставляет их в конец перевода.
+    Обрабатывает: %%, /%, %, / (одиночный слеш в конце строки)
+    """
+    orig_codes = extract_dialog_codes(original)
+    trans_codes = extract_dialog_codes(translated)
+
+    if orig_codes == trans_codes:
+        return translated  # всё ок, не трогаем
+
+    # Убираем из конца перевода все имеющиеся коды завершения
+    cleaned = re.sub(r'(%%|/%|(?<![/%])%|(?<![%\\/])/)\s*$', '', translated).rstrip()
+
+    # Берём суффикс завершения из оригинала
+    orig_suffix_match = re.search(r'((?:%%|/%|(?<![/%])%|(?<![%\\/])/)[\s%%/%/]*$)', original)
+    if orig_suffix_match:
+        suffix = orig_suffix_match.group(1)
+    else:
+        suffix = ''.join(orig_codes)
+
+    return cleaned + suffix
+
+
+def check_codes_process(autofix=False):
+    source_path = source_file_frame_textbox.get()
+    target_path = target_file_frame_textbox.get()
+
+    try:
+        mode = 'Автоисправление' if autofix else 'Проверка кодов'
+        progress_text.configure(text=f'{mode}...')
+        des.update()
+
+        with open(source_path, 'r', encoding='utf-8') as f:
+            source_data = json.load(f)
+        with open(target_path, 'r', encoding='utf-8') as f:
+            target_data = json.load(f)
+
+        broken = 0
+        fixed = 0
+        checked = 0
+
+        for key, orig_val in source_data.items():
+            if key == 'date' or not isinstance(orig_val, str) or not orig_val.strip():
+                continue
+            trans_val = target_data.get(key)
+            if trans_val is None or not isinstance(trans_val, str):
+                continue
+
+            checked += 1
+            orig_codes = extract_dialog_codes(orig_val)
+            trans_codes = extract_dialog_codes(trans_val)
+
+            if orig_codes != trans_codes:
+                broken += 1
+                if autofix:
+                    corrected = fix_dialog_codes(orig_val, trans_val)
+                    target_data[key] = corrected
+                    fixed += 1
+                    log_textbox.insert('0.0',
+                        f'[fix] {key}\n'
+                        f'      БЫЛ: {trans_val}\n'
+                        f'      СТА: {corrected}\n'
+                    )
+                else:
+                    missing = [c for c in orig_codes if c not in trans_codes]
+                    extra = [c for c in trans_codes if c not in orig_codes]
+                    log_textbox.insert('0.0',
+                        f'[!] {key}\n'
+                        f'    ОРИ: {orig_val}\n'
+                        f'    ПЕР: {trans_val}\n'
+                        f'    Нет: {missing}  Лишние: {extra}\n'
+                    )
+                des.update_idletasks()
+
+        if autofix and fixed > 0:
+            import os
+            dir_name, file_name = os.path.split(target_path)
+            base, ext = os.path.splitext(file_name)
+            output_path = os.path.join(dir_name, f'{base}_fixed{ext}')
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(target_data, f, ensure_ascii=False, indent=4)
+            done_sfx.play()
+            progress_text.configure(text=f'Исправлено: {fixed} строк')
+            log_textbox.insert('0.0', f'[OK] Сохранено в: {output_path}\nИсправлено: {fixed} из {checked} строк.\n')
+        elif autofix and fixed == 0:
+            done_sfx.play()
+            progress_text.configure(text=f'Всё в порядке ({checked} строк)')
+            log_textbox.insert('0.0', f'[OK] Проверено {checked} строк — исправлять нечего.\n')
+        elif broken == 0:
+            done_sfx.play()
+            progress_text.configure(text=f'Все коды в порядке ({checked} строк)')
+            log_textbox.insert('0.0', f'[OK] Проверено {checked} строк — ошибок нет.\n')
+        else:
+            error_sfx.play()
+            progress_text.configure(text=f'Найдено проблем: {broken} из {checked}')
+            log_textbox.insert('0.0', f'[!] Итого проблем: {broken} из {checked} строк.\n')
+
+        des.update()
+    except Exception as e:
+        error_sfx.play()
+        progress_text.configure(text=f'Ошибка: {str(e)}')
+        des.update()
+    finally:
+        check_codes_button.configure(state='normal')
+        autofix_codes_button.configure(state='normal')
+        start_translate_button.configure(state='normal')
+        reflow_button.configure(state='normal')
+
+
+def start_check_codes():
+    check_codes_button.configure(state='disabled')
+    autofix_codes_button.configure(state='disabled')
+    start_translate_button.configure(state='disabled')
+    reflow_button.configure(state='disabled')
+    Thread(target=lambda: check_codes_process(autofix=False)).start()
+
+
+def start_autofix_codes():
+    check_codes_button.configure(state='disabled')
+    autofix_codes_button.configure(state='disabled')
+    start_translate_button.configure(state='disabled')
+    reflow_button.configure(state='disabled')
+    Thread(target=lambda: check_codes_process(autofix=True)).start()
+
+
+def start_reflow():
+    reflow_button.configure(state='disabled')
+    start_translate_button.configure(state='disabled')
+    progress_progressbar.set(0)
+    Thread(target=reflow_process).start()
+
 
 def start_translate():
     global music_looped
@@ -511,10 +1061,16 @@ progress_header.place(x=20,y=300)
 progress_text = CTkLabel(main_frame, text='Ready', text_color='white', font=('Arial', 15))
 progress_text.place(x=230,y=300)
 progress_var = IntVar(main_frame, value=0)
-progress_progressbar = CTkProgressBar(main_frame, progress_color='white', fg_color='#2e2e2e', variable=progress_var, width=600, height=10)
+progress_progressbar = CTkProgressBar(main_frame, progress_color='white', fg_color='#2e2e2e', variable=progress_var, width=720, height=10)
 progress_progressbar.place(x=20, y=330)
 start_translate_button = CTkButton(main_frame, text='Translate!', height=30, width=100, text_color='white', bg_color='#2e2e2e', fg_color='#2e2e2e', hover_color='grey', font=('Arial', 15), command=start_translate)
-start_translate_button.place(x=630, y=327)
+start_translate_button.place(x=630, y=350)
+reflow_button = CTkButton(main_frame, text='Выравнить', height=30, width=120, text_color='white', bg_color='#2e2e2e', fg_color='#2e2e2e', hover_color='grey', font=('Arial', 15), command=start_reflow)
+reflow_button.place(x=495, y=350)
+check_codes_button = CTkButton(main_frame, text='Проверить коды', height=30, width=150, text_color='white', bg_color='#2e2e2e', fg_color='#2e2e2e', hover_color='grey', font=('Arial', 15), command=start_check_codes)
+check_codes_button.place(x=330, y=350)
+autofix_codes_button = CTkButton(main_frame, text='Автоисправить', height=30, width=140, text_color='white', bg_color='#2e2e2e', fg_color='#2e2e2e', hover_color='grey', font=('Arial', 15), command=start_autofix_codes)
+autofix_codes_button.place(x=175, y=350)
 
 #Логи
 log_frame = CTkFrame(des, width=760, height=400, fg_color="#3A3838",bg_color="#353535")
